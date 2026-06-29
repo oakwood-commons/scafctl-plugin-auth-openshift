@@ -1,0 +1,34 @@
+# Example solution exercising the openshift auth handler.
+#
+# Authenticate first, then run the solution. For kubectl/oc access use kube
+# login (writes a kubeconfig entry and caches the token):
+#   scafctl kube login <cluster> --handler openshift --server https://api.<cluster>:6443
+#   scafctl run solution -f ./examples/solution.yaml
+#
+# If you only need the token for the solution (no kubeconfig), auth login works
+# too and resolves a cluster by name via the hostname resolver:
+#   scafctl auth login openshift --hostname <cluster>
+apiVersion: scafctl.io/v1
+kind: Solution
+metadata:
+  name: openshift-example
+  description: "Fetch data using the openshift auth handler"
+spec:
+  resolvers:
+    data:
+      description: "Call an API authenticated by the openshift handler"
+      resolve:
+        with:
+          - provider: http
+            inputs:
+              url: https://api.example.com/data
+              authProvider: openshift
+  workflow:
+    actions:
+      show:
+        description: "Display the response"
+        provider: message
+        inputs:
+          type: data
+          data:
+            rslvr: data

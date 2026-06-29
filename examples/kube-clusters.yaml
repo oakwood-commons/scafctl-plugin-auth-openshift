@@ -1,0 +1,33 @@
+# Example scafctl config for resolving clusters by name (NOT a solution).
+#
+# This belongs in your scafctl config file, or a drop-in fragment such as
+# ~/.config/scafctl/config.d/50-clusters.yaml.
+#
+# Once present, `scafctl kube login lab` (or any resolver-known name) resolves
+# the server + handler from config, so no --server / --handler flags are needed.
+#
+# Two ways to make a name resolve for the openshift handler are shown below:
+#   (a) a static alias  -- active in this file
+#   (b) a dynamic resolver -- commented-out alternative (a single document can
+#       only have one kube.clusters key, so uncomment this and remove the
+#       aliases block to use it instead).
+
+# (a) Static alias form: pin one cluster by name.
+kube:
+  clusters:
+    aliases:
+      lab:
+        server: https://api.lab.example.com:6443
+        defaultHandler: openshift
+        authType: oauth
+
+# (b) Dynamic resolver form (HTTP fetch + CEL transform). Uncomment this and
+# remove the aliases block above to resolve the whole fleet by name.
+#
+# kube:
+#   clusters:
+#     resolver:
+#       source:
+#         url: https://clusters.example.com/
+#       transform: '_.map(k, {"name": k, "url": _[k].apiServerURL, "defaultHandler": "openshift", "authType": "oauth"})'
+#       ttl: 10m
