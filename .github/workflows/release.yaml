@@ -1,0 +1,144 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+jobs:
+  test:
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test -race ./...
+
+  release:
+    name: Release
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-catalog:
+    name: Publish Catalog Artifact
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Install scafctl
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TMP_DIR="$(mktemp -d)"
+          gh release download --repo oakwood-commons/scafctl \
+            --pattern 'scafctl_*_Linux_x86_64.tar.gz' \
+            --dir "${TMP_DIR}"
+          tar xzf "${TMP_DIR}"/scafctl_*_Linux_x86_64.tar.gz -C "${TMP_DIR}"
+          sudo mv "${TMP_DIR}/scafctl" /usr/local/bin/scafctl
+          rm -rf "${TMP_DIR}"
+
+      - name: Authenticate to GitHub Container Registry
+        env:
+          CATALOG_PUSH_TOKEN: ${{ secrets.CATALOG_PUSH_TOKEN }}
+        run: |
+          # NOTE: We write the container auth file directly instead of using
+          # `scafctl auth login github --write-registry-auth`. As of scafctl
+          # 0.27.0 the PAT-flow registry bridge fails with
+          # "tokenprovider: source not found: github" even though login
+          # succeeds. scafctl's catalog push/index read ~/.docker/config.json,
+          # so this is the reliable path. Uses CATALOG_PUSH_TOKEN because the
+          # repo-scoped GITHUB_TOKEN cannot write the org-level catalog index.
+          mkdir -p ~/.docker
+          AUTH="$(printf '%s' "${{ github.actor }}:${CATALOG_PUSH_TOKEN}" | base64 -w0)"
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "${AUTH}" > ~/.docker/config.json
+
+      - name: Download release archives
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          mkdir -p dist
+          gh release download "${TAG}" --repo "${{ github.repository }}" --dir dist
+
+      - name: Extract binaries from archives
+        run: |
+          BINARY="scafctl-plugin-auth-openshift"
+          cd dist
+
+          for platform in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64; do
+            archive="${BINARY}_${platform}.tar.gz"
+            if [ -f "${archive}" ]; then
+              mkdir -p "tmp_${platform}"
+              tar xzf "${archive}" -C "tmp_${platform}"
+              mv "tmp_${platform}/${BINARY}" "${BINARY}-${platform//_/-}"
+              rm -rf "tmp_${platform}"
+            fi
+          done
+
+          archive="${BINARY}_windows_amd64.zip"
+          if [ -f "${archive}" ]; then
+            mkdir -p tmp_windows_amd64
+            unzip -o "${archive}" -d tmp_windows_amd64
+            mv "tmp_windows_amd64/${BINARY}.exe" "${BINARY}-windows-amd64.exe"
+            rm -rf tmp_windows_amd64
+          fi
+
+          archive="${BINARY}_windows_arm64.zip"
+          if [ -f "${archive}" ]; then
+            mkdir -p tmp_windows_arm64
+            unzip -o "${archive}" -d tmp_windows_arm64
+            mv "tmp_windows_arm64/${BINARY}.exe" "${BINARY}-windows-arm64.exe"
+            rm -rf tmp_windows_arm64
+          fi
+
+      - name: Build and push catalog artifact
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          BINARY="scafctl-plugin-auth-openshift"
+
+          scafctl build plugin \
+            --force \
+            --name "openshift" \
+            --kind "auth-handler" \
+            --version "${VERSION}" \
+            --platform "linux/amd64=dist/${BINARY}-linux-amd64" \
+            --platform "linux/arm64=dist/${BINARY}-linux-arm64" \
+            --platform "darwin/amd64=dist/${BINARY}-darwin-amd64" \
+            --platform "darwin/arm64=dist/${BINARY}-darwin-arm64" \
+            --platform "windows/amd64=dist/${BINARY}-windows-amd64.exe" \
+            --platform "windows/arm64=dist/${BINARY}-windows-arm64.exe"
+
+          scafctl catalog push \
+            "openshift@${VERSION}" \
+            --catalog "oci://ghcr.io/oakwood-commons" \
+            --kind "auth-handler" \
+            --force
+
+      - name: Refresh catalog index
+        run: |
+          scafctl catalog index push --catalog "oci://ghcr.io/oakwood-commons"
