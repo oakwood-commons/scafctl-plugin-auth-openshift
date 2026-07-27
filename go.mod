@@ -3,10 +3,10 @@ module github.com/oakwood-commons/scafctl-plugin-auth-openshift
 go 1.26.4
 
 require (
-	github.com/go-logr/logr v1.4.3
+	github.com/go-logr/logr v1.4.4
 	github.com/oakwood-commons/scafctl-plugin-sdk v0.16.0
 	github.com/stretchr/testify v1.11.1
-	google.golang.org/grpc v1.82.0
+	google.golang.org/grpc v1.82.1
 )
 
 require (
