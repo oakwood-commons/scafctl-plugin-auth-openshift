@@ -20,6 +20,16 @@ This plugin uses the following names across different surfaces:
 The **handler name** is what users reference in solutions (`authProvider: openshift`).
 It comes from the RPC contract (`GetAuthHandlers`), not from the binary filename.
 
+## Capabilities
+
+| Capability | Value | Behavior |
+|------------|-------|----------|
+| `CapHostname` | `hostname` | Accepts `--hostname` / `--server` at `Login` |
+| `CapTokenHostname` | `token_hostname` | Selects the per-cluster token on `GetToken` (`KUBERNETES_EXEC_INFO` / `--server` / HTTP origin) |
+| `CapInstanceHostname` | `instance_hostname` | Scopes `GetStatus` and `Logout` plugin RPCs per cluster and tags user sessions in `ListCachedTokens` |
+| `CapCallbackPort` | `callback_port` | Pins the loopback OAuth callback TCP port (`--callback-port`) |
+| `CapScopesOnTokenRequest` | `scopes_on_token_request` | Mints scoped service-account tokens via `--scope "<namespace>/<serviceaccount>[@<audience>]"` (or `"user"` for the held user token) |
+
 ## Documentation
 
 - [Design: OpenShift auth handler](docs/design/openshift-auth.md) -- architecture,
@@ -29,13 +39,13 @@ It comes from the RPC contract (`GetAuthHandlers`), not from the binary filename
 
 ## Installation
 
-```bash
+~~~bash
 # Build from source
 task build
 
 # Or download from releases
 gh release download --repo github.com/oakwood-commons/scafctl-plugin-auth-openshift
-```
+~~~
 
 ## Usage
 
@@ -44,17 +54,17 @@ gh release download --repo github.com/oakwood-commons/scafctl-plugin-auth-opensh
 `kube login` authenticates and writes a kubeconfig exec-credential entry, so
 `kubectl`/`oc` mint fresh tokens on demand:
 
-```bash
+~~~bash
 scafctl kube login <cluster> --handler openshift --server https://api.<cluster>:6443
 oc whoami
-```
+~~~
 
 ### Resolve clusters by name (fleet inventory)
 
 Configure `kube.clusters` so a cluster resolves by name -- no `--server` or
 `--handler` needed. A static alias for one-off clusters:
 
-```yaml
+~~~yaml
 kube:
   clusters:
     aliases:
@@ -62,12 +72,12 @@ kube:
         server: https://api.lab.example.com:6443
         defaultHandler: openshift
         authType: oauth
-```
+~~~
 
 Or a dynamic fleet inventory (HTTP fetch + CEL transform), stamping the handler
 and auth type on every entry so `kube login <cluster>` needs no flags:
 
-```yaml
+~~~yaml
 kube:
   clusters:
     resolver:
@@ -75,62 +85,117 @@ kube:
         url: https://clusters.example.com/
       transform: '_.map(k, {"name": k, "url": _[k].apiServerURL, "defaultHandler": "openshift", "authType": "oauth"})'
       ttl: 10m
-```
+~~~
 
 Then:
 
-```bash
+~~~bash
 scafctl kube login prod        # resolves server + handler from config
 oc get pods
-```
+~~~
 
 ### Multiple clusters at once
 
 Log into several clusters; each kubeconfig context mints its own per-cluster
-token (the handler advertises `token_hostname`), so they work simultaneously
-without clobbering one another:
+token (the handler advertises both `hostname` and `token_hostname`, normalizing
+cluster API server URLs identically across `Login`, `GetToken`, `GetStatus`, and
+`Logout`), so they work simultaneously without clobbering one another:
 
-```bash
+~~~bash
 scafctl kube login prod
 scafctl kube login staging
 oc --context prod whoami
 oc --context staging whoami
-```
+~~~
+
+When no per-request `--server` / `KUBERNETES_EXEC_INFO` hostname is supplied on
+`auth token` or `auth status`, the handler falls back to the configured
+`apiServerUrl` (or `OPENSHIFT_API_SERVER` / `KUBERNETES_API_SERVER`) and then
+to the profile's active cluster.
+
+### Browser selection and callback options
+
+The interactive web login honors `--browser`, `auth.browser`, and `$BROWSER`
+(via `oauth-helpers`), falling back to the system default browser with a log
+warning when a preferred browser cannot be launched:
+
+~~~bash
+scafctl kube login prod --browser msedge
+scafctl auth login openshift --hostname prod --browser chrome --callback-port 8400
+~~~
+
+Loopback callback responses use deferred completion and render host-provided
+Blueprint `AuthCallbackPages` (`SuccessHTML` / `FailureHTML`) only after token
+capture and secret-store persistence succeed.
+
+### Profiles and handler configuration
+
+Credentials and active-cluster state are isolated per `--profile`, and per-RPC
+request settings under `auth.handlers.openshift` are resolved statelessly
+without cross-profile bleed:
+
+~~~yaml
+auth:
+  handlers:
+    openshift:
+      oauthClientId: openshift-cli-client
+      callbackHost: 127.0.0.1
+      loginTimeout: 5m
+      insecureSkipTlsVerify: false
+      clusters:
+        prod:
+          url: https://api.prod.example.com:6443
+        staging:
+          url: https://api.staging.example.com:6443
+          oauthClientId: staging-cli-client
+~~~
 
 ### Service-account tokens
 
 Mint a scoped service-account token via the Kubernetes TokenRequest API (your
 logged-in user needs RBAC to create `serviceaccounts/token` in the namespace):
 
-```bash
-scafctl auth token openshift --scope "<namespace>/<serviceaccount>"
+~~~bash
+scafctl auth token openshift --server prod --scope "<namespace>/<serviceaccount>"
 # optional audience: --scope "<namespace>/<serviceaccount>@<audience>"
-```
+~~~
 
 The OAuth login uses a loopback callback; on locked-down networks you can pin
 the port with `scafctl auth login openshift --hostname <cluster> --callback-port <port>`.
 
 ### Log out
 
-```bash
-scafctl kube logout <cluster>   # remove one cluster's kubeconfig entry + cached token
-scafctl auth logout openshift   # clear all cached openshift credentials
-```
+~~~bash
+scafctl kube logout <cluster> --keep-credentials  # remove only <cluster>'s kubeconfig entry (keep cached tokens)
+scafctl kube logout <cluster>                     # remove <cluster>'s kubeconfig entry + clear profile's openshift credentials
+scafctl auth logout openshift                     # clear all cached openshift credentials for the profile
+~~~
+
+> At the plugin gRPC layer (`LogoutRequest.Hostname`, advertised via
+> `instance_hostname`), `Logout` supports per-cluster credential removal. Because
+> the current `scafctl` host CLI sends an empty `LogoutRequest{}` on `auth logout`
+> and on `kube logout` without `--keep-credentials`, pass `--keep-credentials`
+> when removing one kubeconfig context so cached credentials for other clusters in
+> the same profile remain intact.
 
 ### Use in a solution
 
-Reference the handler by name in HTTP requests:
+Reference the handler by name in HTTP requests (pass `scope: user` for the held
+user OAuth token, or `scope: <namespace>/<serviceaccount>[@<audience>]` for a
+scoped service-account token; the HTTP provider automatically forwards the
+request URL origin via `token_hostname`):
 
-```yaml
+~~~yaml
 resolvers:
   data:
     resolve:
       with:
         - provider: http
           inputs:
-            url: https://api.example.com/data
+            url: https://api.prod.example.com:6443/api/v1/namespaces/default/pods
             authProvider: openshift
-```
+            scope: user
+~~~
 
 > The user OAuth credential comes from the browser implicit-grant flow, which
 > has no refresh token. When it expires (~24h), re-run
@@ -138,9 +203,15 @@ resolvers:
 
 ## Development
 
-```bash
+~~~bash
 # Run tests
 task test
+
+# Run tests with race detector
+task test:race
+
+# Run benchmarks
+task bench
 
 # Run linter
 task lint
@@ -150,9 +221,7 @@ task build
 
 # Full CI pipeline (lint + test + build)
 task ci
-```
-
-
+~~~
 
 ## Release
 
@@ -161,13 +230,13 @@ task ci
 A tagged release should publish both the plugin artifact and refresh the
 catalog index:
 
-```bash
+~~~bash
 # Publish the plugin artifact
 scafctl catalog push openshift --version v1.0.0
 
 # Refresh the catalog index so the plugin is discoverable
 scafctl catalog index push --catalog oci://ghcr.io/<REGISTRY_OWNER>
-```
+~~~
 
 Both steps are required. Publishing the artifact alone does not make the
 plugin appear in catalog listings.
@@ -177,11 +246,11 @@ plugin appear in catalog listings.
 scafctl reads container registry credentials from `~/.docker/config.json`. The
 release workflow writes that file directly using the publishing token:
 
-```bash
+~~~bash
 mkdir -p ~/.docker
 AUTH="$(printf '%s' "${GITHUB_ACTOR}:${CATALOG_PUSH_TOKEN}" | base64 -w0)"
 printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "${AUTH}" > ~/.docker/config.json
-```
+~~~
 
 > **Avoid** `scafctl auth login github --flow pat --write-registry-auth`. As of
 > scafctl 0.27.0 that PAT-flow registry bridge fails with
@@ -197,9 +266,9 @@ printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "${AUTH}" > ~/.docker/config.json
 
 Create the publishing secret at the org or repo level:
 
-```bash
+~~~bash
 gh secret set CATALOG_PUSH_TOKEN --org <ORG> --repos scafctl-plugin-auth-openshift --body "$TOKEN"
-```
+~~~
 
 ### Token strategy
 

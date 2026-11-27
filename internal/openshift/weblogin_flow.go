@@ -7,44 +7,54 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net"
-	"net/http"
-	"os/exec"
-	"runtime"
+	"net/url"
 	"strconv"
 	"time"
 
 	"github.com/go-logr/logr"
+	oauth "github.com/oakwood-commons/oauth-helpers"
+	sdkplugin "github.com/oakwood-commons/scafctl-plugin-sdk/plugin"
 )
 
-// browserOpener opens a URL in the system browser. It is a field on Plugin so
-// tests can substitute a no-op or capture the URL.
+const (
+	// callbackPath is the loopback OAuth redirect path registered with
+	// OpenShift's public CLI OAuth client.
+	callbackPath = "/callback"
+
+	// callbackShutdownTimeout bounds graceful draining of the localhost callback
+	// HTTP response after the login outcome is settled.
+	callbackShutdownTimeout = 5 * time.Second
+)
+
+// browserOpener opens a URL in the user's browser. It is a field on Plugin so
+// tests can substitute a fake browser without launching external processes.
 type browserOpener func(ctx context.Context, rawURL string) error
 
-// defaultBrowserOpener launches the platform's default browser.
+type browserPreferenceKeyType struct{}
+
+func withBrowserPreference(ctx context.Context, browser string) context.Context {
+	return context.WithValue(ctx, browserPreferenceKeyType{}, browser)
+}
+
+func browserPreferenceFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(browserPreferenceKeyType{}).(string)
+	return v
+}
+
+// defaultBrowserOpener opens rawURL using oauth-helpers, honoring any explicit
+// browser preference (--browser / auth.browser), $BROWSER, and OS default
+// fallback while logging fallback warnings through logr.
 func defaultBrowserOpener(ctx context.Context, rawURL string) error {
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "darwin":
-		// #nosec G204 -- rawURL is an OAuth authorize URL we constructed; the
-		// command name is a constant and the URL is the single argument.
-		cmd = exec.CommandContext(ctx, "open", rawURL)
-	case "windows":
-		// #nosec G204 -- see darwin case; constant command, constructed URL.
-		cmd = exec.CommandContext(ctx, "rundll32", "url.dll,FileProtocolHandler", rawURL)
-	default:
-		// #nosec G204 -- see darwin case; constant command, constructed URL.
-		cmd = exec.CommandContext(ctx, "xdg-open", rawURL)
-	}
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	// Reap the browser process so it does not linger as a zombie.
-	go func() { _ = cmd.Wait() }()
-	return nil
+	return oauth.OpenBrowserWithPreference(
+		ctx,
+		rawURL,
+		browserPreferenceFromContext(ctx),
+		oauth.WithWarningHandler(func(msg string) {
+			logr.FromContextOrDiscard(ctx).V(0).Info(sanitizeUntrustedText(msg, 512))
+		}),
+	)
 }
 
 // webLoginResult is the credential captured from the OAuth implicit-grant
@@ -55,177 +65,166 @@ type webLoginResult struct {
 	ExpiresAt   time.Time
 }
 
+// webLoginParams bundles the inputs for runWebLogin.
+type webLoginParams struct {
+	Config        *Config
+	Metadata      *oauthMetadata
+	OpenBrowser   browserOpener
+	Browser       string
+	CallbackPages *sdkplugin.AuthCallbackPages
+	// Commit runs after a valid token arrives from the callback server and
+	// before Complete(true) releases the final HTML page to the browser. If
+	// Commit returns an error, Complete(false) is called so the browser renders
+	// the failure page instead of a false success message.
+	Commit func(ctx context.Context, res *webLoginResult) error
+}
+
+// startImplicitCallback starts the oauth-helpers implicit-grant loopback server
+// configured with deferred completion and optional host-supplied Blueprint
+// callback pages.
+func startImplicitCallback(ctx context.Context, host string, port int, state string, pages *sdkplugin.AuthCallbackPages) (*oauth.CallbackServer, error) {
+	normHost := normalizeCallbackHost(host)
+	if !isLoopbackHost(normHost) {
+		return nil, fmt.Errorf("callback host %q is not a loopback address; refusing to expose the OAuth token relay on a non-loopback interface", sanitizeUntrustedText(host, 64))
+	}
+
+	opts := []oauth.CallbackOption{
+		oauth.WithCallbackHost(normHost),
+		oauth.WithCallbackPath(callbackPath),
+		oauth.WithDeferredCompletion(),
+	}
+	if pages != nil {
+		opts = append(opts, oauth.WithCallbackPages(oauth.CallbackPages{
+			SuccessHTML: pages.SuccessHTML,
+			FailureHTML: pages.FailureHTML,
+		}))
+	}
+
+	cs, err := oauth.StartImplicitCallbackServer(ctx, port, state, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("start loopback callback listener: %w", err)
+	}
+	return cs, nil
+}
+
 // runWebLogin performs the OpenShift OAuth implicit-grant browser flow:
-// it starts a loopback callback server, opens the browser to the cluster's
-// authorization endpoint, and captures the token returned in the URL fragment.
-func runWebLogin(ctx context.Context, cfg *Config, meta *oauthMetadata, open browserOpener) (*webLoginResult, error) {
+// it validates the cluster's authorization endpoint, starts a loopback callback
+// server bound to caller ctx, opens the user's preferred or default browser
+// under a timeout-bounded context, waits up to LoginTimeout for the callback
+// token, runs p.Commit under its own post-callback deadline (so completing just
+// before LoginTimeout cannot race Complete(true) against an expired wait
+// context), and settles + drains the callback server.
+func runWebLogin(ctx context.Context, p webLoginParams) (*webLoginResult, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
+	cfg := p.Config
+
+	validAuthzEndpoint, err := validateAuthorizationEndpoint(p.Metadata.AuthorizationEndpoint, cfg.APIServerURL)
+	if err != nil {
+		return nil, err
+	}
 
 	state, err := randomState()
 	if err != nil {
 		return nil, fmt.Errorf("generate state: %w", err)
 	}
 
-	if !isLoopbackHost(cfg.CallbackHost) {
-		return nil, fmt.Errorf("callback host %q is not a loopback address; refusing to expose the OAuth token relay on a non-loopback interface", cfg.CallbackHost)
-	}
-
-	listener, err := net.Listen("tcp", net.JoinHostPort(cfg.CallbackHost, strconv.Itoa(cfg.CallbackPort)))
-	if err != nil {
-		return nil, fmt.Errorf("start callback listener: %w", err)
-	}
-	defer func() { _ = listener.Close() }()
-
-	port := listener.Addr().(*net.TCPAddr).Port
-	redirectURI := buildRedirectURI(cfg.CallbackHost, port)
-
-	resultCh := make(chan webLoginResult, 1)
-	errCh := make(chan error, 1)
-	srv := &http.Server{
-		Handler:           newCallbackHandler(state, resultCh, errCh),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-	go func() {
-		if serveErr := srv.Serve(listener); serveErr != nil && serveErr != http.ErrServerClosed {
-			select {
-			case errCh <- serveErr:
-			default:
-			}
-		}
-	}()
-	defer func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
-	}()
-
-	authURL := buildAuthorizeURL(meta.AuthorizationEndpoint, cfg.OAuthClientID, redirectURI, state)
-	lgr.V(1).Info("opening browser for OpenShift OAuth login", "url", authURL)
-	if open != nil {
-		if openErr := open(ctx, authURL); openErr != nil {
-			lgr.V(0).Info("failed to open browser; open this URL manually", "url", authURL)
-		}
-	}
-
 	timeout := cfg.LoginTimeout
 	if timeout <= 0 {
 		timeout = DefaultLoginTimeout
 	}
+
+	callbackServer, err := startImplicitCallback(ctx, cfg.CallbackHost, cfg.CallbackPort, state, p.CallbackPages)
+	if err != nil {
+		return nil, err
+	}
+
+	drained := false
+	drainCallbackServer := func() {
+		if drained {
+			return
+		}
+		drained = true
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), callbackShutdownTimeout)
+		defer shutdownCancel()
+		_ = callbackServer.Shutdown(shutdownCtx)
+	}
+	defer drainCallbackServer()
+
+	authURL := buildAuthorizeURL(validAuthzEndpoint, cfg.OAuthClientID, callbackServer.RedirectURI, state)
+	safeAuthURL := sanitizeUntrustedText(authURL, 2048)
+	lgr.V(1).Info("opening browser for OpenShift OAuth login", "url", safeAuthURL, "browser", sanitizeUntrustedText(p.Browser, 64))
+	if p.OpenBrowser != nil {
+		openCtx, cancelOpen := context.WithTimeout(withBrowserPreference(ctx, p.Browser), timeout)
+		openErr := p.OpenBrowser(openCtx, authURL)
+		cancelOpen()
+		if openErr != nil && ctx.Err() == nil {
+			lgr.V(0).Info("failed to open browser; open this URL manually", "url", safeAuthURL, "error", sanitizeUntrustedText(openErr.Error(), 256))
+		}
+	}
+
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
 	select {
-	case res := <-resultCh:
-		return &res, nil
-	case err := <-errCh:
-		return nil, err
+	case cbRes := <-callbackServer.ResultChan():
+		timer.Stop()
+		if cbRes.Err != nil {
+			drainCallbackServer()
+			return nil, fmt.Errorf("authorization failed: %w", cbRes.Err)
+		}
+		res := &webLoginResult{
+			AccessToken: cbRes.AccessToken,
+			TokenType:   firstNonEmpty(cbRes.TokenType, "Bearer"),
+			ExpiresAt:   expiryFromExpiresIn(cbRes.ExpiresIn),
+		}
+		if p.Commit != nil {
+			commitCtx, cancelCommit := context.WithTimeout(ctx, DefaultHTTPTimeout)
+			commitErr := p.Commit(commitCtx, res)
+			cancelCommit()
+			if commitErr != nil {
+				callbackServer.Complete(false)
+				drainCallbackServer()
+				return nil, commitErr
+			}
+		}
+		callbackServer.Complete(true)
+		drainCallbackServer()
+		return res, nil
+
 	case <-timer.C:
+		callbackServer.Complete(false)
+		drainCallbackServer()
 		return nil, fmt.Errorf("web login: no response from browser within %s", timeout)
+
 	case <-ctx.Done():
+		callbackServer.Complete(false)
+		drainCallbackServer()
 		return nil, fmt.Errorf("web login: cancelled: %w", ctx.Err())
 	}
 }
 
-// newCallbackHandler builds the HTTP handler for the loopback callback server.
-//
-// The implicit grant returns the token in the URL fragment, which browsers do
-// not send to the server. The /callback page serves a small script that reads
-// the fragment client-side and POSTs the values back as a JSON body. The token
-// therefore never appears in a URL query string, server access log, or browser
-// history.
-func newCallbackHandler(state string, resultCh chan<- webLoginResult, errCh chan<- error) http.Handler {
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			handleCallbackPost(w, r, state, resultCh, errCh)
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write([]byte(fragmentExtractorHTML))
-	})
-
-	return mux
-}
-
-// callbackPayload is the JSON body the browser POSTs after extracting the
-// implicit-grant values from the URL fragment.
-type callbackPayload struct {
-	AccessToken      string `json:"access_token"`
-	TokenType        string `json:"token_type"`
-	ExpiresIn        string `json:"expires_in"`
-	State            string `json:"state"`
-	Error            string `json:"error"`
-	ErrorDescription string `json:"error_description"`
-}
-
-// handleCallbackPost decodes the relayed OAuth result, validates the CSRF state,
-// and delivers the token (or error) to the waiting login flow.
-func handleCallbackPost(w http.ResponseWriter, r *http.Request, state string, resultCh chan<- webLoginResult, errCh chan<- error) {
-	const maxBody = 64 << 10 // 64 KiB is ample for an OAuth callback payload.
-	var payload callbackPayload
-	if err := json.NewDecoder(io.LimitReader(r.Body, maxBody)).Decode(&payload); err != nil {
-		writeCallbackJSON(w, http.StatusBadRequest, false)
-		select {
-		case errCh <- fmt.Errorf("authorization failed: invalid callback payload: %w", err):
-		default:
-		}
-		return
-	}
-	if payload.Error != "" {
-		writeCallbackJSON(w, http.StatusBadRequest, false)
-		select {
-		case errCh <- fmt.Errorf("authorization failed: %s: %s", payload.Error, payload.ErrorDescription):
-		default:
-		}
-		return
-	}
-	if payload.State != state {
-		writeCallbackJSON(w, http.StatusBadRequest, false)
-		select {
-		case errCh <- fmt.Errorf("authorization failed: state mismatch (possible CSRF)"):
-		default:
-		}
-		return
-	}
-	if payload.AccessToken == "" {
-		writeCallbackJSON(w, http.StatusBadRequest, false)
-		select {
-		case errCh <- fmt.Errorf("authorization failed: no access_token in callback"):
-		default:
-		}
-		return
-	}
-
-	res := webLoginResult{
-		AccessToken: payload.AccessToken,
-		TokenType:   firstNonEmpty(payload.TokenType, "Bearer"),
-		ExpiresAt:   expiryFromExpiresIn(payload.ExpiresIn),
-	}
-	writeCallbackJSON(w, http.StatusOK, true)
-	select {
-	case resultCh <- res:
-	default:
-	}
-}
-
-// buildRedirectURI builds the loopback OAuth callback URL. It uses
-// net.JoinHostPort so IPv6 loopback literals (e.g. "::1") are bracketed,
-// yielding "http://[::1]:PORT/callback" rather than an invalid URL.
-func buildRedirectURI(host string, port int) string {
-	return fmt.Sprintf("http://%s/callback", net.JoinHostPort(host, strconv.Itoa(port)))
-}
-
 // buildAuthorizeURL constructs the OpenShift OAuth authorize URL for the
-// implicit grant (response_type=token).
+// implicit grant (response_type=token) using structured query encoding so any
+// existing non-reserved query parameters on authzEndpoint are preserved cleanly.
 func buildAuthorizeURL(authzEndpoint, clientID, redirectURI, state string) string {
-	return fmt.Sprintf(
-		"%s?client_id=%s&response_type=token&redirect_uri=%s&state=%s",
-		authzEndpoint,
-		queryEscape(clientID),
-		queryEscape(redirectURI),
-		queryEscape(state),
-	)
+	u, err := url.Parse(authzEndpoint)
+	if err != nil {
+		return fmt.Sprintf(
+			"%s?client_id=%s&response_type=token&redirect_uri=%s&state=%s",
+			authzEndpoint,
+			queryEscape(clientID),
+			queryEscape(redirectURI),
+			queryEscape(state),
+		)
+	}
+	u.Fragment = ""
+	q := u.Query()
+	q.Set("client_id", clientID)
+	q.Set("response_type", "token")
+	q.Set("redirect_uri", redirectURI)
+	q.Set("state", state)
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 // expiryFromExpiresIn converts an OAuth expires_in (seconds) string into an
@@ -271,63 +270,3 @@ func firstNonEmpty(vals ...string) string {
 	}
 	return ""
 }
-
-// writeCallbackJSON writes a minimal JSON acknowledgement to the browser's
-// relay POST. The browser renders the user-facing message from the response.
-func writeCallbackJSON(w http.ResponseWriter, status int, ok bool) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if ok {
-		_, _ = io.WriteString(w, `{"ok":true}`)
-		return
-	}
-	_, _ = io.WriteString(w, `{"ok":false}`)
-}
-
-// fragmentExtractorHTML reads the implicit-grant values from the URL fragment
-// client-side and POSTs them as a JSON body, so the token never lands in a URL
-// query string, access log, or browser history. It then clears the fragment.
-const fragmentExtractorHTML = `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>scafctl login</title></head>
-<body>
-<p id="scafctl-msg">Completing sign-in&hellip;</p>
-<script>
-(function () {
-  var hash = window.location.hash || "";
-  if (hash.charAt(0) === "#") { hash = hash.substring(1); }
-  var p = new URLSearchParams(hash);
-  var payload = {};
-  ["access_token", "token_type", "expires_in", "state", "error", "error_description"].forEach(function (k) {
-    var v = p.get(k);
-    if (v) { payload[k] = v; }
-  });
-  function show(msg) { document.getElementById("scafctl-msg").textContent = msg; }
-  fetch(window.location.pathname, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
-  }).then(function (r) {
-    if (!r.ok) {
-      show("Login failed. Return to the terminal for details.");
-      return;
-    }
-    var secs = 30;
-    (function tick() {
-      show("Login successful. You can return to the terminal. This tab closes in " + secs + "s...");
-      if (secs <= 0) {
-        // window.close() only works on script-opened windows; re-opening self
-        // first improves the odds of closing a user-navigated OAuth tab.
-        try { window.open("", "_self"); window.close(); } catch (e) {}
-        return;
-      }
-      secs -= 1;
-      setTimeout(tick, 1000);
-    })();
-  }).catch(function () {
-    show("Login failed. Return to the terminal for details.");
-  }).finally(function () {
-    try { history.replaceState(null, "", window.location.pathname); } catch (e) {}
-  });
-})();
-</script>
-</body></html>`

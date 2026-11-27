@@ -104,11 +104,17 @@ func mintServiceAccountToken(ctx context.Context, client httpDoer, p mintSAParam
 		return nil, fmt.Errorf("token request: empty token in response")
 	}
 
+	now := time.Now()
+	expiresAt := resp.Status.ExpirationTimestamp
+	if expiresAt.IsZero() {
+		expiresAt = now.Add(time.Duration(expSecs) * time.Second)
+	}
+
 	return &cacheEntry{
 		AccessToken:    resp.Status.Token,
 		TokenType:      "Bearer",
-		ExpiresAt:      resp.Status.ExpirationTimestamp,
-		CachedAt:       time.Now(),
+		ExpiresAt:      expiresAt,
+		CachedAt:       now,
 		Kind:           kindServiceAccount,
 		APIServer:      p.APIServerURL,
 		Namespace:      p.Namespace,
@@ -136,10 +142,9 @@ func validateK8sName(name string) error {
 	return nil
 }
 
-// truncate returns at most n bytes of b as a string, for safe error messages.
+// truncate returns at most n sanitized runes of b as a terminal-safe string
+// for error messages, stripping control characters and never splitting
+// multi-byte UTF-8 sequences.
 func truncate(b []byte, n int) string {
-	if len(b) > n {
-		return string(b[:n])
-	}
-	return string(b)
+	return sanitizeUntrustedText(string(b), n)
 }

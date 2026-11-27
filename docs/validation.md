@@ -34,13 +34,20 @@ scafctl kube login "$CLUSTER2"       # a second cluster, for multi-cluster check
 
 Expected: `Logged in to "<CLUSTER1>"`, user `$USER_EMAIL`.
 
-Fixed callback port (optional):
+Fixed callback port and browser preference (optional):
 
 ```bash
-scafctl auth login openshift --hostname "$CLUSTER1" --callback-port 8400
+scafctl auth login openshift --hostname "$CLUSTER1" --callback-port 8400 --browser chrome
 ```
 
-Expected: the OAuth loopback binds port 8400; login succeeds.
+Expected: the OAuth loopback binds port 8400, launches the requested browser (or logs a fallback warning if unavailable), and renders the Blueprint completion page after credential persistence succeeds.
+
+Profile isolation (optional):
+
+```bash
+scafctl auth login openshift --profile lab --hostname "$CLUSTER1"
+scafctl auth status openshift --profile lab
+```
 
 ## 2. Status and inspection
 
@@ -48,7 +55,7 @@ Expected: the OAuth loopback binds port 8400; login succeeds.
 scafctl auth status openshift        # one row per cluster, active marked, per-cluster expiry
 scafctl auth status openshift -o json
 scafctl auth list openshift          # cached token inventory (user logins + SA tokens)
-scafctl auth handlers openshift      # handler details and capabilities
+scafctl auth handlers openshift      # handler details and capabilities (hostname, token_hostname, instance_hostname, callback_port, scopes_on_token_request)
 ```
 
 Expected: `auth status` lists each logged-in cluster (e.g. `$CLUSTER1`,
@@ -95,8 +102,9 @@ Notes:
 ## 5. Logout
 
 ```bash
-scafctl kube logout "$CLUSTER1"      # remove CLUSTER1's kubeconfig entry + clear its credentials
-scafctl auth logout openshift        # clear all cached openshift credentials
+scafctl kube logout "$CLUSTER1" --keep-credentials   # remove CLUSTER1's kubeconfig entry while keeping CLUSTER2's cached credentials
+scafctl kube logout "$CLUSTER2"                      # remove CLUSTER2's kubeconfig entry + clear profile's openshift credentials
+scafctl auth logout openshift                        # clear all cached openshift credentials for the profile
 ```
 
 Re-check:

@@ -4,13 +4,14 @@
 package openshift
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,12 +21,15 @@ import (
 // clusterServer is a fake OpenShift API server for tests. It serves OAuth
 // discovery, whoami, and the TokenRequest endpoint.
 type clusterServer struct {
+	mu           sync.RWMutex
 	srv          *httptest.Server
 	authzURL     string
 	whoamiName   string
 	whoamiStatus int
+	whoamiHook   func()
 	saToken      string
 	saStatus     int
+	saHook       func()
 }
 
 // newClusterServer starts a fake API server with sensible defaults.
@@ -48,24 +52,42 @@ func newClusterServer(t *testing.T) *clusterServer {
 	})
 
 	mux.HandleFunc(whoamiPath, func(w http.ResponseWriter, _ *http.Request) {
-		if cs.whoamiStatus != http.StatusOK {
-			w.WriteHeader(cs.whoamiStatus)
+		cs.mu.RLock()
+		hook := cs.whoamiHook
+		statusCode := cs.whoamiStatus
+		name := cs.whoamiName
+		cs.mu.RUnlock()
+
+		if hook != nil {
+			hook()
+		}
+		if statusCode != http.StatusOK {
+			w.WriteHeader(statusCode)
 			return
 		}
 		resp := userInfo{}
-		resp.Metadata.Name = cs.whoamiName
+		resp.Metadata.Name = name
 		writeJSON(w, http.StatusOK, resp)
 	})
 
 	mux.HandleFunc("/api/v1/namespaces/", func(w http.ResponseWriter, _ *http.Request) {
-		if cs.saStatus != http.StatusOK && cs.saStatus != http.StatusCreated {
-			w.WriteHeader(cs.saStatus)
+		cs.mu.RLock()
+		hook := cs.saHook
+		statusCode := cs.saStatus
+		tok := cs.saToken
+		cs.mu.RUnlock()
+
+		if hook != nil {
+			hook()
+		}
+		if statusCode != http.StatusOK && statusCode != http.StatusCreated {
+			w.WriteHeader(statusCode)
 			return
 		}
 		var resp tokenRequestResponse
-		resp.Status.Token = cs.saToken
+		resp.Status.Token = tok
 		resp.Status.ExpirationTimestamp = time.Now().Add(time.Hour)
-		writeJSON(w, cs.saStatus, resp)
+		writeJSON(w, statusCode, resp)
 	})
 
 	cs.srv = httptest.NewServer(mux)
@@ -75,6 +97,8 @@ func newClusterServer(t *testing.T) *clusterServer {
 }
 
 func (cs *clusterServer) authzEndpoint() string {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
 	if cs.authzURL != "" {
 		return cs.authzURL
 	}
@@ -90,8 +114,8 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 // fakeBrowser returns a browserOpener that simulates a successful implicit-grant
-// login by POSTing the token to the callback server as a JSON body, exactly as
-// the in-browser JavaScript would.
+// login by asynchronously POSTing the URL-encoded fragment parameters to the
+// loopback callback server's /token endpoint, matching oauth-helpers' bridge JS.
 func fakeBrowser(token string, expiresIn int) browserOpener {
 	return func(ctx context.Context, rawURL string) error {
 		u, err := url.Parse(rawURL)
@@ -108,22 +132,37 @@ func fakeBrowser(token string, expiresIn int) browserOpener {
 		if expiresIn > 0 {
 			payload["expires_in"] = fmt.Sprintf("%d", expiresIn)
 		}
-		return postCallback(ctx, redirect, payload)
+		reqCtx := context.WithoutCancel(ctx)
+		go func() {
+			cbCtx, cancel := context.WithTimeout(reqCtx, 5*time.Second)
+			defer cancel()
+			_ = postCallback(cbCtx, redirect, payload)
+		}()
+		return nil
 	}
 }
 
-// postCallback POSTs a JSON callback payload to the loopback callback server,
-// mirroring the fragment-extractor script the browser runs.
+// postCallback POSTs form-encoded implicit-grant fragment parameters to the
+// loopback callback server's /token endpoint, mirroring oauth-helpers'
+// implicitBridgeScript.
 func postCallback(ctx context.Context, callbackURL string, payload map[string]string) error {
-	body, err := json.Marshal(payload)
+	parsed, err := url.Parse(callbackURL)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, callbackURL, bytes.NewReader(body))
+	origin := parsed.Scheme + "://" + parsed.Host
+
+	form := make(url.Values, len(payload))
+	for k, v := range payload {
+		form.Set(k, v)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, origin+"/token", strings.NewReader(form.Encode()))
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", origin)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
@@ -133,17 +172,27 @@ func postCallback(ctx context.Context, callbackURL string, payload map[string]st
 }
 
 // errorBrowser returns a browserOpener that simulates the OAuth server denying
-// the request.
+// the request with a state-matched implicit-grant error redirect.
 func errorBrowser() browserOpener {
 	return func(ctx context.Context, rawURL string) error {
 		u, err := url.Parse(rawURL)
 		if err != nil {
 			return err
 		}
-		return postCallback(ctx, u.Query().Get("redirect_uri"), map[string]string{
-			"error":             "access_denied",
-			"error_description": "user denied access",
-		})
+		q := u.Query()
+		redirect := q.Get("redirect_uri")
+		state := q.Get("state")
+		reqCtx := context.WithoutCancel(ctx)
+		go func() {
+			cbCtx, cancel := context.WithTimeout(reqCtx, 5*time.Second)
+			defer cancel()
+			_ = postCallback(cbCtx, redirect, map[string]string{
+				"error":             "access_denied",
+				"error_description": "user denied access",
+				"state":             state,
+			})
+		}()
+		return nil
 	}
 }
 
@@ -171,4 +220,10 @@ func mustSettings(t *testing.T, apiServerURL string) (cfg sdkplugin.ProviderConf
 	}
 	cfg.Settings = map[string]json.RawMessage{"apiServerUrl": raw}
 	return cfg
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return fn(r)
 }

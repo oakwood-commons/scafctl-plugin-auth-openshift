@@ -21,8 +21,9 @@ spec:
         with:
           - provider: http
             inputs:
-              url: https://api.example.com/data
+              url: https://api.example.com:6443/api/v1/namespaces/default/pods
               authProvider: openshift
+              scope: user
   workflow:
     actions:
       show:
