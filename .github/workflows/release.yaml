@@ -133,10 +133,9 @@ jobs:
             --platform "windows/amd64=dist/${BINARY}-windows-amd64.exe" \
             --platform "windows/arm64=dist/${BINARY}-windows-arm64.exe"
 
-          scafctl catalog push \
+          scafctl catalog push auth-handler \
             "openshift@${VERSION}" \
             --catalog "oci://ghcr.io/oakwood-commons" \
-            --kind "auth-handler" \
             --force
 
       - name: Refresh catalog index
