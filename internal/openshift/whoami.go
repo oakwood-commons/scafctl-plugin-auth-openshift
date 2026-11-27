@@ -37,13 +37,15 @@ func whoami(ctx context.Context, client httpDoer, apiServerURL, bearer string) (
 		return nil, fmt.Errorf("whoami request: %w", err)
 	}
 	if status != 200 {
-		return nil, fmt.Errorf("whoami: unexpected status %d from %s", status, endpoint)
+		return nil, fmt.Errorf("whoami: unexpected status %d from %s", status, redactEndpointForError(endpoint))
 	}
 
 	var info userInfo
 	if err := json.Unmarshal(body, &info); err != nil {
 		return nil, fmt.Errorf("whoami: decode response: %w", err)
 	}
+	info.Metadata.Name = sanitizeUntrustedText(info.Metadata.Name, 256)
+	info.FullName = sanitizeUntrustedText(info.FullName, 256)
 	if info.Metadata.Name == "" {
 		return nil, fmt.Errorf("whoami: response missing user name")
 	}

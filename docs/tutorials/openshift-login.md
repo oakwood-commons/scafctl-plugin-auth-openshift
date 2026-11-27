@@ -51,8 +51,11 @@ flowchart LR
     style E fill:#7048e8,color:#fff
 ```
 
-- **OAuth cluster** -> a browser opens; sign in and the tab closes itself. The
-  token is captured via a localhost callback and stored in your keyring.
+- **OAuth cluster** -> your preferred or default browser opens (`--browser` /
+  `$BROWSER` supported); sign in and the Blueprint callback page confirms
+  completion once the token is captured via the localhost callback and stored in
+  your keyring (scoped by `--profile` and canonical cluster URL so multiple
+  clusters work simultaneously).
 - **OIDC / Entra cluster** -> no OpenShift browser flow; scafctl reuses your
   `entra` login to mint a cluster-scoped token.
 
@@ -106,6 +109,7 @@ spec:
             inputs:
               url: https://api.mycluster.example.com:6443/api/v1/namespaces/default/pods
               authProvider: openshift
+              scope: user
   workflow:
     actions:
       show:
@@ -129,18 +133,17 @@ scoped SA token via the Kubernetes TokenRequest API -- still no `oc`:
 
 ```bash
 scafctl auth token openshift \
-  --namespace infra-auto \
-  --sa pipeline \
-  --audience openshift
+  --server mycluster \
+  --scope "infra-auto/pipeline@openshift"
 ```
 
 Example: feed an Azure WIF exchange.
 
 ```bash
-export AZURE_FEDERATED_TOKEN="$(scafctl auth token openshift --ns infra-auto --sa pipeline)"
+export AZURE_FEDERATED_TOKEN="$(scafctl auth token openshift --server mycluster --scope infra-auto/pipeline --raw)"
 export AZURE_CLIENT_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 export AZURE_TENANT_ID="yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
-scafctl run resolver -f platform-assets-wif.yaml -r name=iac-team
+scafctl run resolver -f federated-api-wif.yaml -r name=iac-team
 ```
 
 ---
@@ -159,10 +162,12 @@ podman pull default-route-openshift-image-registry.mycluster/myns/myimage
 ## Step 6 -- Log out
 
 ```bash
-scafctl kube logout mycluster
+scafctl kube logout mycluster                      # remove kubeconfig context + clear profile's openshift credentials
+scafctl kube logout mycluster --keep-credentials   # remove only this cluster's kubeconfig context
+scafctl auth logout openshift                      # clear all cached openshift credentials for the profile
 ```
 
-Clears the keyring entry and the managed kubeconfig context.
+Clears the managed kubeconfig context and (unless `--keep-credentials` is passed) the profile's cached `openshift` credentials.
 
 ---
 

@@ -139,20 +139,26 @@ func TestBuildAuthorizeURL(t *testing.T) {
 	assert.Contains(t, got, "redirect_uri=http%3A%2F%2F127.0.0.1%3A5000%2Fcallback")
 }
 
-func TestBuildRedirectURI(t *testing.T) {
+func TestStartImplicitCallbackRedirectURI(t *testing.T) {
 	tests := []struct {
-		name string
-		host string
-		port int
-		want string
+		name       string
+		host       string
+		wantPrefix string
 	}{
-		{name: "ipv4", host: "127.0.0.1", port: 5000, want: "http://127.0.0.1:5000/callback"},
-		{name: "hostname", host: "localhost", port: 8080, want: "http://localhost:8080/callback"},
-		{name: "ipv6 loopback is bracketed", host: "::1", port: 5000, want: "http://[::1]:5000/callback"},
+		{name: "ipv4", host: "127.0.0.1", wantPrefix: "http://127.0.0.1:"},
+		{name: "hostname", host: "localhost", wantPrefix: "http://localhost:"},
+		{name: "ipv6 loopback is bracketed", host: "::1", wantPrefix: "http://[::1]:"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, buildRedirectURI(tc.host, tc.port))
+			cs, err := startImplicitCallback(context.Background(), tc.host, 0, "state-1", nil)
+			if err != nil && tc.host == "::1" {
+				t.Skipf("IPv6 loopback unavailable in test environment: %v", err)
+			}
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = cs.Close() })
+			assert.True(t, strings.HasPrefix(cs.RedirectURI, tc.wantPrefix), "got %s", cs.RedirectURI)
+			assert.True(t, strings.HasSuffix(cs.RedirectURI, callbackPath), "got %s", cs.RedirectURI)
 		})
 	}
 }

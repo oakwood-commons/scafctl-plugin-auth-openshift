@@ -162,8 +162,11 @@ Steps:
    exec-credential stanza.
 
 > Note: the token arrives in the URL **fragment** (`#access_token=...`), which a
-> server never receives directly. The callback page serves a tiny HTML/JS
-> snippet that re-posts the fragment to the callback server as a query param.
+> server never receives directly. The callback page (`oauth-helpers`) serves a
+> self-contained HTML/JS bridge with strict script-hash CSP that clears the URL
+> fragment and POSTs the parameters as a form body to `/token` on the loopback
+> server, holding the final Blueprint callback page via deferred completion
+> until credential persistence finishes.
 
 ---
 
@@ -256,9 +259,9 @@ flowchart TB
     P --> Web[weblogin_flow.go<br/>callback server + browser + implicit grant]
     P --> Who[whoami.go<br/>username + best-effort projects]
     P --> TR[tokenrequest.go<br/>SA token minting]
-    P --> Tok[token.go / cache.go<br/>keyring custody]
-    P --> HTTP[http.go<br/>injectable HTTPClient]
-    P --> Mock[mock.go / fake_host_test.go<br/>test doubles]
+    P --> Tok[cache.go<br/>keyring custody]
+    P --> HTTP[http.go<br/>reused HTTP clients + redirect guards]
+    P --> Mock[mock_test.go / fake_host_test.go<br/>test doubles]
 
     style Web fill:#d6336c,color:#fff
 ```
@@ -267,9 +270,12 @@ flowchart TB
 
 ## Key technical decisions
 
-1. **Flow & capabilities** -- advertise `auth.FlowInteractive` (browser) +
-   `CapCallbackPort`, not `FlowDeviceCode`. The SDK has no "oauth" flow constant;
-   interactive is the right match for a localhost-callback browser flow.
+1. **Flow & capabilities** -- advertise `auth.FlowInteractive` (browser) plus
+   `CapHostname`, `CapTokenHostname`, `CapInstanceHostname`, `CapCallbackPort`,
+   and `CapScopesOnTokenRequest`. The SDK has no "oauth" flow constant;
+   interactive is the right match for a localhost-callback browser flow, and
+   `CapTokenHostname` enables simultaneous multi-cluster `kube login` and HTTP
+   provider origin-based token routing.
 
 2. **Avoid `client-go`** note: -- plugin binaries >32 MiB fail to fetch (oras-go
    32 MiB blob cap), which is exactly what broke the `kubeconfig` plugin.
@@ -278,8 +284,10 @@ flowchart TB
    failure.
 
 3. **Token custody** -- store in the host secret store
-   (`HostClientFromContext(ctx).SetSecret/GetSecret/DeleteSecret`), keyed by
-   cluster, mirroring entra's `cache.go`.
+   (`HostClientFromContext(ctx).SetSecret/GetSecret/DeleteSecret`), scoped by
+   auth profile and keyed by canonical normalized cluster API server URL so
+   `Login`, `GetToken` (`TokenOptions.Hostname`), `GetStatus`, and `Logout`
+   derive identical keys across aliases, schemes, ports, and trailing slashes.
 
 4. **Generic, no hardcoded org values** -- `apiServerURL`, OAuth client ID, and
    audiences come from config / `LoginRequest`, with `openshift-cli-client` as
@@ -336,12 +344,12 @@ scafctl kube login mycluster --server https://api.mycluster.example.com:6443
 kubectl get pods            # kubectl calls scafctl for a fresh token
 
 # Mint an SA token inside a solution / for downstream OIDC
-scafctl auth token openshift --namespace infra-auto --sa pipeline --audience openshift
+scafctl auth token openshift --server mycluster --scope "infra-auto/pipeline@openshift"
 
 # Docker/Podman pull from the OpenShift integrated registry via the cred helper
 podman pull default-route-openshift-image-registry.mycluster/myns/myimage
 
-scafctl kube logout mycluster   # clears keyring + managed kubeconfig entries
+scafctl kube logout mycluster   # clears managed kubeconfig entries + profile credentials (use --keep-credentials for kubeconfig only)
 ```
 
 ---
